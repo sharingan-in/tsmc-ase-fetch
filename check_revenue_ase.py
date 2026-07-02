@@ -1,23 +1,29 @@
 """
-Checks the ASE Technology Holding monthly revenues page for a "June" entry.
-If found (and we haven't already notified about it), posts a notification to
-a Discord webhook and records that fact in state.json so we don't spam the
-channel on every subsequent 10-minute run.
+Monitors multiple investor-relations pages for the appearance of June revenue data
+and posts a notification to a Discord webhook when found.
+
+Targets:
+  - ASE Technology Holding monthly revenues page: a "June" row appears in the
+    table once published (previously blank rows simply don't exist yet).
+  - TSMC monthly revenue page: all month rows (Jan-Dec) are always listed;
+    what changes is whether the Net Revenue figure next to "Jun." is filled in.
 
 Designed to run via GitHub Actions on a schedule (see .github/workflows/check-revenue.yml).
 The Discord webhook URL is read from the DISCORD_WEBHOOK_URL environment variable / secret —
 never hardcode it in this file.
+
+Dedupe: each target's notified state is tracked separately in state.json so we
+only post once per target when its June data first appears, not on every run.
 """
 
 import json
 import os
+import re
 import sys
 import requests
 from bs4 import BeautifulSoup
+from playwright.sync_api import sync_playwright
 
-URL = "https://ir.aseglobal.com/html/ir_revenues.php"
-HOMEPAGE_URL = "https://ir.aseglobal.com/html/index.php"
-KEYWORD = "June"
 STATE_FILE = "state.json"
 
 BROWSER_HEADERS = {
@@ -40,37 +46,98 @@ BROWSER_HEADERS = {
 }
 
 
-def fetch_page(url: str) -> str:
+def fetch_page(url: str, homepage_url: str) -> str:
     """
-    Fetch the target page using a session that first visits the site's homepage.
-    This picks up cookies (e.g. WAF/CDN challenge cookies) the way a real browser
-    would, before requesting the actual page we care about.
+    Fetch a page using a session that first visits the site's homepage to pick
+    up cookies (e.g. WAF/CDN challenge cookies) the way a real browser would.
+    Works for sites that gate on cookies/headers but don't require a JS challenge.
     """
     session = requests.Session()
     session.headers.update(BROWSER_HEADERS)
-
-    # Warm-up request: establishes cookies and looks like normal navigation.
-    session.get(HOMEPAGE_URL, timeout=30)
-
-    resp = session.get(url, timeout=30, headers={"Referer": HOMEPAGE_URL})
+    session.get(homepage_url, timeout=30)
+    resp = session.get(url, timeout=30, headers={"Referer": homepage_url})
     resp.raise_for_status()
     return resp.text
 
 
-def check_for_keyword(html: str, keyword: str) -> bool:
-    """Look for the keyword specifically inside the revenues table's month column."""
+def fetch_page_browser(url: str, homepage_url: str) -> str:
+    """
+    Fetch a page using a real headless Chromium browser via Playwright.
+    Needed for sites protected by a JS-executing bot-detection challenge
+    (e.g. Cloudflare Bot Management), which plain HTTP requests can never
+    satisfy since no JavaScript actually runs. This solves the challenge and
+    picks up a fresh, valid cookie (e.g. __cf_bm) automatically on every run —
+    no manual cookie capture or rotation needed.
+    """
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=BROWSER_HEADERS["User-Agent"],
+            locale="en-US",
+        )
+        page = context.new_page()
+        # Warm-up navigation, same idea as the requests-based approach:
+        # visiting the homepage first lets the challenge resolve naturally.
+        page.goto(homepage_url, wait_until="networkidle", timeout=45000)
+        page.goto(url, wait_until="networkidle", timeout=45000)
+        content = page.content()
+        browser.close()
+        return content
+
+
+def check_ase_june(html: str) -> bool:
+    """ASE: a row for June simply appears in the table once published."""
     soup = BeautifulSoup(html, "html.parser")
     table = soup.find("table", class_="revenues-table")
     if not table:
-        # Fallback: search the whole page if the table structure changes
-        return keyword.lower() in soup.get_text().lower()
+        return "june" in soup.get_text().lower()
 
-    rows = table.find_all("tr")
-    for row in rows:
+    for row in table.find_all("tr"):
         cells = row.find_all("td")
-        if cells and keyword.lower() in cells[0].get_text(strip=True).lower():
+        if cells and "june" in cells[0].get_text(strip=True).lower():
             return True
     return False
+
+
+def check_tsmc_june(html: str) -> bool:
+    """
+    TSMC: the "Jun." row always exists (Jan-Dec are pre-listed). We look for
+    that row and check whether its Net Revenue cell actually has a number in it.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    for table in soup.find_all("table"):
+        for row in table.find_all("tr"):
+            cells = row.find_all(["td", "th"])
+            if not cells:
+                continue
+            month_text = cells[0].get_text(strip=True).lower()
+            if month_text.startswith("jun"):
+                for cell in cells[1:]:
+                    text = cell.get_text(strip=True)
+                    if re.search(r"\d", text):
+                        return True
+                return False  # row found but still blank
+    return False
+
+
+TARGETS = [
+    {
+        "key": "ase",
+        "label": "ASE Technology Holding",
+        "url": "https://ir.aseglobal.com/html/ir_revenues.php",
+        "homepage": "https://ir.aseglobal.com/html/index.php",
+        "fetch_method": "requests",
+        "check": check_ase_june,
+    },
+    {
+        "key": "tsmc",
+        "label": "TSMC",
+        "url": "https://investor.tsmc.com/english/monthly-revenue/2026",
+        "homepage": "https://investor.tsmc.com/english",
+        "fetch_method": "browser",
+        "check": check_tsmc_june,
+    },
+]
 
 
 def notify_discord(webhook_url: str, message: str) -> None:
@@ -82,7 +149,7 @@ def load_state() -> dict:
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
             return json.load(f)
-    return {"notified": False}
+    return {}
 
 
 def save_state(state: dict) -> None:
@@ -97,26 +164,42 @@ def main():
         sys.exit(1)
 
     state = load_state()
-    html = fetch_page(URL)
-    found = check_for_keyword(html, KEYWORD)
+    state_changed = False
 
-    if found and not state.get("notified"):
-        message = f"✅ '{KEYWORD}' revenue entry detected on {URL}"
-        notify_discord(webhook_url, message)
-        state["notified"] = True
-        save_state(state)
-        print(f"Keyword '{KEYWORD}' found — Discord notified and state saved.")
-    elif found and state.get("notified"):
-        print(f"Keyword '{KEYWORD}' found but already notified previously. Skipping.")
-    else:
-        # Keyword not present. If it previously was (e.g. page reverted), reset state
-        # so a future re-appearance triggers a fresh notification.
-        if state.get("notified"):
-            state["notified"] = False
-            save_state(state)
-            print(f"Keyword '{KEYWORD}' no longer present — state reset.")
+    for target in TARGETS:
+        key = target["key"]
+        target_state = state.get(key, {"notified": False})
+
+        try:
+            if target["fetch_method"] == "browser":
+                html = fetch_page_browser(target["url"], target["homepage"])
+            else:
+                html = fetch_page(target["url"], target["homepage"])
+            found = target["check"](html)
+        except Exception as e:
+            print(f"[{target['label']}] Fetch failed: {e}", file=sys.stderr)
+            continue
+
+        if found and not target_state.get("notified"):
+            message = f"✅ June revenue data detected for {target['label']}: {target['url']}"
+            notify_discord(webhook_url, message)
+            target_state["notified"] = True
+            state[key] = target_state
+            state_changed = True
+            print(f"[{target['label']}] June found — Discord notified and state saved.")
+        elif found and target_state.get("notified"):
+            print(f"[{target['label']}] June found but already notified previously. Skipping.")
         else:
-            print(f"Keyword '{KEYWORD}' not found yet. No action taken.")
+            if target_state.get("notified"):
+                target_state["notified"] = False
+                state[key] = target_state
+                state_changed = True
+                print(f"[{target['label']}] June no longer present — state reset.")
+            else:
+                print(f"[{target['label']}] June not found yet. No action taken.")
+
+    if state_changed:
+        save_state(state)
 
 
 if __name__ == "__main__":
