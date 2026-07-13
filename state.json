@@ -1,8 +1,8 @@
 {
   "ase": {
-    "notified": true
+    "notified": false
   },
   "tsmc": {
-    "notified": true
+    "notified": false
   }
 }
